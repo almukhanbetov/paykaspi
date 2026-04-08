@@ -6,22 +6,51 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/joho/godotenv"
 )
 
 // Константы
 const (
-	MYSQL_DSN     = "smart_db:Asetaset_97@tcp(127.0.0.1:3306)/smart_db"
-	MQTT_BROKER   = "tcp://127.0.0.1:45001"
-	MQTT_USER     = "vds_admin"
-	MQTT_PASS     = "Asetaset_97"
-	HTTP_TIMEOUT  = 12 * time.Second
+	MQTT_BROKER  = "tcp://127.0.0.1:45001"
+	MQTT_USER    = "vds_admin"
+	MQTT_PASS    = "Asetaset_97"
+	HTTP_TIMEOUT = 12 * time.Second
 )
+
+type Config struct {
+	MysqlDSN    string
+	MqttBroker  string
+	MqttUser    string
+	MqttPass    string
+	HttpTimeout time.Duration
+}
+
+func LoadConfig() *Config {
+	cfg := &Config{
+		MysqlDSN:    os.Getenv("MYSQL_DSN"),
+		MqttBroker:  os.Getenv("MQTT_BROKER"),
+		MqttUser:    os.Getenv("MQTT_USER"),
+		MqttPass:    os.Getenv("MQTT_PASS"),
+		HttpTimeout: 12 * time.Second,
+	}
+
+	// проверки
+	if cfg.MysqlDSN == "" {
+		log.Fatal("MYSQL_DSN not set")
+	}
+	if cfg.MqttBroker == "" {
+		log.Fatal("MQTT_BROKER not set")
+	}
+
+	return cfg
+}
 
 var (
 	db  *sql.DB
@@ -41,19 +70,19 @@ type CheckRequest struct {
 }
 
 type CheckResponse struct {
-	TxnID   string      `json:"txn_id"`
-	Result  int         `json:"result"`
-	Comment string      `json:"comment,omitempty"`
-	Account string      `json:"account,omitempty"`
-	BIN     string      `json:"bin,omitempty"`
-	Tariffs []Tariff    `json:"tariffs,omitempty"`
+	TxnID   string   `json:"txn_id"`
+	Result  int      `json:"result"`
+	Comment string   `json:"comment,omitempty"`
+	Account string   `json:"account,omitempty"`
+	BIN     string   `json:"bin,omitempty"`
+	Tariffs []Tariff `json:"tariffs,omitempty"`
 }
 
 // Изменено: Account теперь int64, удалены ID и TxnDate
 type PayRequest struct {
 	Command string  `json:"command"`
 	TxnID   string  `json:"txn_id"`
-	Account int64   `json:"account"`  // Изменено с string на int64
+	Account int64   `json:"account"` // Изменено с string на int64
 	Sum     float64 `json:"sum"`
 	// ID и TxnDate удалены, так как они не отправляются в MQTT
 }
@@ -72,31 +101,50 @@ type Tariff struct {
 	Sum  float64 `json:"sum"`
 }
 
-func initDB() error {
+func initDB(cfg *Config) error {
 	var err error
-	db, err = sql.Open("mysql", MYSQL_DSN)
-	if err != nil {
-		return err
+
+	maxRetries := 10
+	delay := 3 * time.Second
+
+	for i := 1; i <= maxRetries; i++ {
+		log.Printf("Connecting to DB (attempt %d/%d)...", i, maxRetries)
+
+		db, err = sql.Open("mysql", cfg.MysqlDSN)
+		if err != nil {
+			log.Println("DB open error:", err)
+		} else {
+			err = db.Ping()
+			if err == nil {
+				log.Println("Connected to DB successfully")
+				break
+			}
+			log.Println("DB ping error:", err)
+		}
+
+		if i < maxRetries {
+			log.Printf("Retrying in %v...\n", delay)
+			time.Sleep(delay)
+		}
 	}
-	
-	err = db.Ping()
+
 	if err != nil {
-		return err
+		return fmt.Errorf("could not connect to DB after %d attempts: %w", maxRetries, err)
 	}
-	
-	// Проверяем/создаем таблицу payments
+
+	// создаём таблицу
 	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS payments (
-			id BIGINT AUTO_INCREMENT PRIMARY KEY,
-			txn_id VARCHAR(64) UNIQUE,
-			account VARCHAR(64),
-			sum DECIMAL(10,2),
-			result INT,
-			comment TEXT,
-			created TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			INDEX idx_txn_id (txn_id),
-			INDEX idx_account (account)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+	CREATE TABLE IF NOT EXISTS payments (
+		id BIGINT AUTO_INCREMENT PRIMARY KEY,
+		txn_id VARCHAR(64) UNIQUE,
+		account VARCHAR(64),
+		sum DECIMAL(10,2),
+		result INT,
+		comment TEXT,
+		created TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		INDEX idx_txn_id (txn_id),
+		INDEX idx_account (account)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 	`)
 	return err
 }
@@ -107,32 +155,32 @@ func initMQTT() error {
 	opts.SetUsername(MQTT_USER)
 	opts.SetPassword(MQTT_PASS)
 	opts.SetClientID(fmt.Sprintf("payment_app_%d", time.Now().Unix()))
-	
+
 	// Важно: Используем MQTT v3.1.1 для совместимости с библиотекой v1.5.1
 	// opts.SetProtocolVersion(4) // 4 = MQTT v3.1.1
-	
-	opts.SetCleanSession(false)  // хранить сессию и сообщения
+
+	opts.SetCleanSession(false) // хранить сессию и сообщения
 	opts.SetAutoReconnect(true)
 	opts.SetConnectRetry(true)
-	
+
 	// Настройка keepalive для предотвращения отключений
 	opts.SetKeepAlive(60 * time.Second)
 	opts.SetPingTimeout(10 * time.Second)
-	
+
 	mq = mqtt.NewClient(opts)
 	if token := mq.Connect(); token.Wait() && token.Error() != nil {
 		return token.Error()
 	}
-	
+
 	// Подписываемся на топики ответов с QoS 1
 	if token := mq.Subscribe("payment/check", 1, handleCheckResponse); token.Wait() && token.Error() != nil {
 		log.Printf("Error subscribing to payment/check: %v", token.Error())
 	}
-	
+
 	if token := mq.Subscribe("payment/pay", 1, handlePayResponse); token.Wait() && token.Error() != nil {
 		log.Printf("Error subscribing to payment/pay: %v", token.Error())
 	}
-	
+
 	log.Println("MQTT connected and subscribed")
 	return nil
 }
@@ -140,25 +188,25 @@ func initMQTT() error {
 // Обработчики MQTT сообщений
 func handleCheckResponse(client mqtt.Client, msg mqtt.Message) {
 	log.Printf("Received message on topic %s: %s", msg.Topic(), string(msg.Payload()))
-	
+
 	var response map[string]interface{}
 	if err := json.Unmarshal(msg.Payload(), &response); err != nil {
 		log.Println("JSON unmarshal error:", err)
 		return
 	}
-	
+
 	txnID, ok := response["txn_id"].(string)
 	if !ok {
 		log.Println("No txn_id in response")
 		return
 	}
-	
+
 	log.Printf("Processing check response for txn_id: %s", txnID)
-	
+
 	mux.RLock()
 	ch, exists := checkResponses[txnID]
 	mux.RUnlock()
-	
+
 	if exists {
 		select {
 		case ch <- response:
@@ -173,25 +221,25 @@ func handleCheckResponse(client mqtt.Client, msg mqtt.Message) {
 
 func handlePayResponse(client mqtt.Client, msg mqtt.Message) {
 	log.Printf("Received message on topic %s: %s", msg.Topic(), string(msg.Payload()))
-	
+
 	var response map[string]interface{}
 	if err := json.Unmarshal(msg.Payload(), &response); err != nil {
 		log.Println("JSON unmarshal error:", err)
 		return
 	}
-	
+
 	txnID, ok := response["txn_id"].(string)
 	if !ok {
 		log.Println("No txn_id in response")
 		return
 	}
-	
+
 	log.Printf("Processing pay response for txn_id: %s", txnID)
-	
+
 	mux.RLock()
 	ch, exists := payResponses[txnID]
 	mux.RUnlock()
-	
+
 	if exists {
 		select {
 		case ch <- response:
@@ -241,13 +289,13 @@ func getTariffsByAccount(account string) ([]map[string]interface{}, error) {
 func checkAccountExists(account string) (bool, string, error) {
 	var count int
 	var bin string
-	
+
 	// Проверяем существование account
 	err := db.QueryRow("SELECT COUNT(*), COALESCE(bin, '') FROM devices WHERE account = ?", account).Scan(&count, &bin)
 	if err != nil {
 		return false, "", err
 	}
-	
+
 	return count > 0, bin, nil
 }
 
@@ -267,30 +315,30 @@ func savePayment(txnID, account string, sum float64, result int, comment string)
 	if err != nil {
 		return 0, err
 	}
-	
+
 	id, err := res.LastInsertId()
 	if err != nil {
 		return 0, err
 	}
-	
+
 	return id, nil
 }
 
 // HTTP обработчик
 func paymentHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	
+
 	command := r.URL.Query().Get("command")
 	txnID := r.URL.Query().Get("txn_id")
 	account := r.URL.Query().Get("account")
-	
+
 	log.Printf("Received request: command=%s, txn_id=%s, account=%s", command, txnID, account)
-	
+
 	if command == "" || txnID == "" || account == "" {
 		http.Error(w, `{"error":"Missing parameters"}`, http.StatusBadRequest)
 		return
 	}
-	
+
 	switch command {
 	case "check":
 		handleCheckCommand(w, r, txnID, account)
@@ -314,7 +362,7 @@ func handleCheckCommand(w http.ResponseWriter, r *http.Request, txnID, account s
 		json.NewEncoder(w).Encode(response)
 		return
 	}
-	
+
 	if !exists {
 		log.Printf("Account not found: %s", account)
 		response := CheckResponse{
@@ -325,14 +373,14 @@ func handleCheckCommand(w http.ResponseWriter, r *http.Request, txnID, account s
 		json.NewEncoder(w).Encode(response)
 		return
 	}
-	
+
 	// Создаем канал для ответа от ESP
 	responseChan := make(chan map[string]interface{}, 1)
-	
+
 	mux.Lock()
 	checkResponses[txnID] = responseChan
 	mux.Unlock()
-	
+
 	// Очищаем канал и удаляем из мапы при выходе
 	defer func() {
 		mux.Lock()
@@ -341,14 +389,14 @@ func handleCheckCommand(w http.ResponseWriter, r *http.Request, txnID, account s
 		close(responseChan)
 		log.Printf("Cleaned up check channel for txn_id: %s", txnID)
 	}()
-	
+
 	// Отправляем запрос в MQTT
 	request := CheckRequest{
 		Command: "check",
 		TxnID:   txnID,
 		Account: account,
 	}
-	
+
 	jsonData, err := json.Marshal(request)
 	if err != nil {
 		log.Printf("Error marshaling check request: %v", err)
@@ -360,20 +408,20 @@ func handleCheckCommand(w http.ResponseWriter, r *http.Request, txnID, account s
 		json.NewEncoder(w).Encode(response)
 		return
 	}
-	
+
 	log.Printf("Publishing check request to payment/app for txn_id: %s", txnID)
-	
+
 	// ИСПРАВЛЕНО: Используем стандартный Publish вместо PublishWithProperties
 	token := mq.Publish("payment/app", 1, false, jsonData)
 	if !token.WaitTimeout(5 * time.Second) {
 		log.Printf("Timeout publishing to MQTT for txn_id: %s", txnID)
 	}
-	
+
 	// Ждем ответа от ESP
 	select {
 	case espResponse := <-responseChan:
 		log.Printf("Received ESP response for check txn_id: %s", txnID)
-		
+
 		// Проверяем result от ESP
 		resultVal, ok := espResponse["result"]
 		if !ok {
@@ -386,7 +434,7 @@ func handleCheckCommand(w http.ResponseWriter, r *http.Request, txnID, account s
 			json.NewEncoder(w).Encode(response)
 			return
 		}
-		
+
 		// Преобразуем result в int
 		var result int
 		switch v := resultVal.(type) {
@@ -397,7 +445,7 @@ func handleCheckCommand(w http.ResponseWriter, r *http.Request, txnID, account s
 		default:
 			result = 1
 		}
-		
+
 		if result == 0 {
 			// Получаем тарифы
 			tariffs, err := getTariffsByAccount(account)
@@ -411,21 +459,21 @@ func handleCheckCommand(w http.ResponseWriter, r *http.Request, txnID, account s
 				json.NewEncoder(w).Encode(response)
 				return
 			}
-			
+
 			// Формируем финальный ответ
 			var tariffList []Tariff
 			for _, t := range tariffs {
 				id, _ := t["id"].(string)
 				name, _ := t["name"].(string)
 				sum, _ := t["sum"].(float64)
-				
+
 				tariffList = append(tariffList, Tariff{
 					ID:   id,
 					Name: name,
 					Sum:  sum,
 				})
 			}
-			
+
 			response := CheckResponse{
 				TxnID:   txnID,
 				Result:  0,
@@ -444,7 +492,7 @@ func handleCheckCommand(w http.ResponseWriter, r *http.Request, txnID, account s
 			}
 			json.NewEncoder(w).Encode(response)
 		}
-		
+
 	case <-time.After(HTTP_TIMEOUT):
 		log.Printf("Timeout waiting for ESP check response for txn_id: %s", txnID)
 		response := CheckResponse{
@@ -469,7 +517,7 @@ func handlePayCommand(w http.ResponseWriter, r *http.Request, txnID, account str
 		json.NewEncoder(w).Encode(response)
 		return
 	}
-	
+
 	if exists {
 		log.Printf("Duplicate txn_id: %s", txnID)
 		response := map[string]interface{}{
@@ -480,10 +528,10 @@ func handlePayCommand(w http.ResponseWriter, r *http.Request, txnID, account str
 		json.NewEncoder(w).Encode(response)
 		return
 	}
-	
+
 	// Получаем остальные параметры
 	sumStr := r.URL.Query().Get("sum")
-	
+
 	// Проверяем account в БД
 	accountExists, bin, err := checkAccountExists(account)
 	if err != nil {
@@ -496,7 +544,7 @@ func handlePayCommand(w http.ResponseWriter, r *http.Request, txnID, account str
 		json.NewEncoder(w).Encode(response)
 		return
 	}
-	
+
 	if !accountExists {
 		log.Printf("Account not found for payment: %s", account)
 		response := PayResponse{
@@ -507,7 +555,7 @@ func handlePayCommand(w http.ResponseWriter, r *http.Request, txnID, account str
 		json.NewEncoder(w).Encode(response)
 		return
 	}
-	
+
 	// Парсим сумму
 	var sum float64
 	if sumStr != "" {
@@ -524,14 +572,14 @@ func handlePayCommand(w http.ResponseWriter, r *http.Request, txnID, account str
 			return
 		}
 	}
-	
+
 	// Создаем канал для ответа от ESP
 	responseChan := make(chan map[string]interface{}, 1)
-	
+
 	mux.Lock()
 	payResponses[txnID] = responseChan
 	mux.Unlock()
-	
+
 	// Очищаем канал и удаляем из мапы при выходе
 	defer func() {
 		mux.Lock()
@@ -540,7 +588,7 @@ func handlePayCommand(w http.ResponseWriter, r *http.Request, txnID, account str
 		close(responseChan)
 		log.Printf("Cleaned up pay channel for txn_id: %s", txnID)
 	}()
-	
+
 	// ИСПРАВЛЕНО: Отправляем запрос в MQTT только с нужными полями
 	accountInt, _ := strconv.ParseInt(account, 10, 64)
 	request := PayRequest{
@@ -549,7 +597,7 @@ func handlePayCommand(w http.ResponseWriter, r *http.Request, txnID, account str
 		Account: accountInt,
 		Sum:     sum,
 	}
-	
+
 	jsonData, err := json.Marshal(request)
 	if err != nil {
 		log.Printf("Error marshaling pay request: %v", err)
@@ -561,26 +609,26 @@ func handlePayCommand(w http.ResponseWriter, r *http.Request, txnID, account str
 		json.NewEncoder(w).Encode(response)
 		return
 	}
-	
+
 	log.Printf("Publishing pay request to payment/app for txn_id: %s", txnID)
 	log.Printf("JSON payload: %s", string(jsonData))
-	
+
 	// ИСПРАВЛЕНО: Используем стандартный Publish вместо PublishWithProperties
 	token := mq.Publish("payment/app", 1, false, jsonData)
 	if !token.WaitTimeout(5 * time.Second) {
 		log.Printf("Timeout publishing to MQTT for txn_id: %s", txnID)
 	}
-	
+
 	// Ждем ответа от ESP
 	select {
 	case espResponse := <-responseChan:
 		log.Printf("Received ESP response for pay txn_id: %s", txnID)
-		
+
 		// Проверяем result от ESP
 		resultVal, ok := espResponse["result"]
 		if !ok {
 			log.Printf("No result in ESP response for txn_id: %s", txnID)
-			
+
 			// Сохраняем неудачный платеж
 			prvTxn, err := savePayment(txnID, account, sum, 1, "Неверный ответ от устройства")
 			if err != nil {
@@ -593,7 +641,7 @@ func handlePayCommand(w http.ResponseWriter, r *http.Request, txnID, account str
 				json.NewEncoder(w).Encode(response)
 				return
 			}
-			
+
 			response := PayResponse{
 				TxnID:   txnID,
 				PrvTxn:  prvTxn,
@@ -603,7 +651,7 @@ func handlePayCommand(w http.ResponseWriter, r *http.Request, txnID, account str
 			json.NewEncoder(w).Encode(response)
 			return
 		}
-		
+
 		// Преобразуем result в int
 		var result int
 		switch v := resultVal.(type) {
@@ -614,7 +662,7 @@ func handlePayCommand(w http.ResponseWriter, r *http.Request, txnID, account str
 		default:
 			result = 1
 		}
-		
+
 		if result == 0 {
 			// Сохраняем успешный платеж в БД
 			prvTxn, err := savePayment(txnID, account, sum, 0, "OK")
@@ -628,7 +676,7 @@ func handlePayCommand(w http.ResponseWriter, r *http.Request, txnID, account str
 				json.NewEncoder(w).Encode(response)
 				return
 			}
-			
+
 			response := PayResponse{
 				TxnID:   txnID,
 				PrvTxn:  prvTxn,
@@ -644,7 +692,7 @@ func handlePayCommand(w http.ResponseWriter, r *http.Request, txnID, account str
 			if msg, ok := espResponse["comment"].(string); ok && msg != "" {
 				comment = msg
 			}
-			
+
 			prvTxn, err := savePayment(txnID, account, sum, result, comment)
 			if err != nil {
 				log.Printf("Error saving payment: %v", err)
@@ -656,7 +704,7 @@ func handlePayCommand(w http.ResponseWriter, r *http.Request, txnID, account str
 				json.NewEncoder(w).Encode(response)
 				return
 			}
-			
+
 			response := PayResponse{
 				TxnID:   txnID,
 				PrvTxn:  prvTxn,
@@ -665,10 +713,10 @@ func handlePayCommand(w http.ResponseWriter, r *http.Request, txnID, account str
 			}
 			json.NewEncoder(w).Encode(response)
 		}
-		
+
 	case <-time.After(HTTP_TIMEOUT):
 		log.Printf("Timeout waiting for ESP pay response for txn_id: %s", txnID)
-		
+
 		// НЕ сохраняем платеж в БД при таймауте от ESP
 		// Просто возвращаем ошибку
 		response := PayResponse{
@@ -683,33 +731,34 @@ func handlePayCommand(w http.ResponseWriter, r *http.Request, txnID, account str
 func main() {
 	// Настройка логгера
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	
+	godotenv.Load()
+	cfg := LoadConfig()
 	// Инициализация БД
 	log.Println("Initializing database...")
-	if err := initDB(); err != nil {
+	if err := initDB(cfg); err != nil {
 		log.Fatal("DB init error:", err)
 	}
 	defer db.Close()
 	log.Println("Database initialized successfully")
-	
+
 	// Инициализация MQTT
 	log.Println("Initializing MQTT...")
 	if err := initMQTT(); err != nil {
 		log.Fatal("MQTT init error:", err)
 	}
-	
+
 	// Тестовое сообщение
 	token := mq.Publish("payment/app", 1, false, "hello smart24.kz")
 	if token.Wait() && token.Error() != nil {
 		log.Printf("Test publish error: %v", token.Error())
 	}
-	
+
 	defer mq.Disconnect(250)
 	log.Println("MQTT initialized successfully")
-	
+
 	// Настройка HTTP сервера
 	http.HandleFunc("/payment_app.cgi", paymentHandler)
-	
+
 	log.Println("Server starting on :8080")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal("HTTP server error:", err)
