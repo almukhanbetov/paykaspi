@@ -759,8 +759,8 @@ func main() {
 	// Настройка HTTP сервера
 	http.HandleFunc("/payment_app.cgi", paymentHandler)
 
-	log.Println("Server starting on :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	log.Println("Server starting on :8180")
+	if err := http.ListenAndServe(":8180", nil); err != nil {
 		log.Fatal("HTTP server error:", err)
 	}
 }
